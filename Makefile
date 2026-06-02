@@ -2,10 +2,9 @@
 # Target: Linux x86-64, GCC or Clang
 #
 # Targets:
-#   make          Build the c2c binary (default)
+#   make          Build c2cl
 #   make clean    Remove build artefacts
 #   make install  Install to PREFIX/bin (default: /usr/local)
-#   make help     Print this summary
 
 CC      ?= gcc
 PREFIX  ?= /usr/local
