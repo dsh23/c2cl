@@ -254,6 +254,32 @@ int main(int argc, char *argv[])
             .topo           = topo_ptr,
         };
 
+        /* Warn if --topology is passed with a benchmark that ignores it */
+        if (use_topology && b != 4)
+            fprintf(stderr,
+                "WARN: --topology has no effect on benchmark %d. "
+                "Use -b 4 --topology for topology-aware measurement.\n", b);
+
+        /* Runtime estimate */
+        {
+            long n_pairs = (long)n_cores * (n_cores - 1) / 2;
+            /* Sequential benchmarks (1,2,3): one pair at a time */
+            /* Parallel benchmark (4): n/2 pairs per round, n-1 rounds */
+            long effective_pairs = (b == 4)
+                ? (n_cores - 1)          /* rounds, each ~same cost as 1 pair */
+                : n_pairs;
+            /* Conservative avg round-trip: 50 ns covers most topologies */
+            double est_ns  = (double)effective_pairs
+                             * (num_samples + 5)
+                             * num_iterations
+                             * 50.0;
+            double est_sec = est_ns / 1e9;
+            if (est_sec < 60)
+                fprintf(stderr, "  Estimated runtime: %.0f seconds\n", est_sec);
+            else
+                fprintf(stderr, "  Estimated runtime: %.1f minutes\n", est_sec / 60.0);
+        }
+
         switch (b) {
         case 1:
             fprintf(stderr, "\n1) CAS latency on a single shared cache line\n\n");
