@@ -64,21 +64,33 @@ typedef struct {
      * Lightweight spin barrier for per-sample synchronisation.
      * Both threads increment arrive_count; the last one resets it.
      * No futex, no syscall, no context switch — safe for HT pairs.
+     *
+     * _Alignas forces this onto its own cache line regardless of the
+     * containing struct's alignment, so the spin barrier's atomic writes
+     * cannot share a cache line with the contested flag below.
      */
-    _Atomic uint32_t arrive_count;
+    _Alignas(CACHE_LINE_SIZE) _Atomic uint32_t arrive_count;
     char _arrive_pad[CACHE_LINE_SIZE - sizeof(_Atomic uint32_t)];
 
     /*
-     * The contested flag — one cache line, intentionally not padded.
-     * Starts as PONG so ping can go first in each timed window.
+     * The contested flag — alone on its own cache line.
+     * _Alignas ensures it starts at a cache-line boundary.
      */
-    _Atomic int flag;
+    _Alignas(CACHE_LINE_SIZE) _Atomic int flag;
     char _flag_pad[CACHE_LINE_SIZE - sizeof(_Atomic int)];
 
-    _Atomic int timed_out;
+    /*
+     * timed_out: written by main thread on watchdog timeout,
+     * read by both worker threads in their CAS loops.
+     * On its own cache line so the watchdog write does not invalidate
+     * any hot line in the worker threads' caches.
+     */
+    _Alignas(CACHE_LINE_SIZE) _Atomic int timed_out;
+    char _timeout_pad[CACHE_LINE_SIZE - sizeof(_Atomic int)];
 
+    /* Cold fields — accessed once at startup */
     uint32_t num_iterations;
-    uint32_t num_samples;    /* includes warmup */
+    uint32_t num_samples;
     double  *results;
 } CACHE_ALIGNED cas_state_t;
 
@@ -211,8 +223,26 @@ static int run_pair(int core_ping, int core_pong,
                     uint32_t num_iterations, uint32_t num_samples,
                     double *out_results)
 {
-    cas_state_t *s = calloc(1, sizeof(cas_state_t) + sizeof(int));
-    if (!s) { perror("calloc"); exit(1); }
+    /*
+     * Allocate state struct with cache-line alignment.
+     * calloc returns only 16-byte aligned memory on most systems, which
+     * is insufficient for our CACHE_ALIGNED struct. If misaligned, the
+     * carefully-placed flag and arrive_count fields could end up on the
+     * SAME cache line, causing the spin barrier's writes to invalidate
+     * the flag line on every sample and inflating measured latency by
+     * 5-10×. posix_memalign guarantees the requested alignment.
+     */
+    size_t alloc_size = sizeof(cas_state_t) + sizeof(int);
+    /* Round up to multiple of CACHE_LINE_SIZE for posix_memalign */
+    alloc_size = (alloc_size + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
+
+    cas_state_t *s = NULL;
+    if (posix_memalign((void **)&s, CACHE_LINE_SIZE, alloc_size) != 0
+            || !s) {
+        perror("posix_memalign");
+        exit(1);
+    }
+    memset(s, 0, alloc_size);
 
     *(int *)((char *)s + sizeof(cas_state_t)) = core_pong;
 
@@ -246,7 +276,7 @@ static int run_pair(int core_ping, int core_pong,
     pthread_join(t_ping, NULL);
 
     pthread_barrier_destroy(&s->start_barrier);
-    free(s);
+    free(s);   /* posix_memalign-allocated memory is freed with free() */
     return timed_out ? -1 : 0;
 }
 
