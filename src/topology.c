@@ -83,35 +83,45 @@ static int read_int_from_file(const char *path, int *out)
 
 /*
  * Read the L3 cache domain ID for a CPU.
- * Tries cache/index3/id first (most direct), then falls back to
- * cache/index2/id (L2 domain, acceptable for CCX detection on Zen 2).
+ *
+ * The kernel exposes each cache via /sys/devices/system/cpu/cpuN/cache/indexM/
+ * with attributes:
+ *   type   — "Data", "Instruction", or "Unified"
+ *   level  — "1", "2", "3", ...
+ *   id     — domain identifier; CPUs sharing a cache share an id
+ *
+ * On AMD Zen, the L2 cache is per-physical-core (Unified) and the L3 cache
+ * is per-CCD (Unified). Filtering only on type=="Unified" therefore returns
+ * the L2 domain (per-core) on Zen, which is wrong — we need the L3.
+ *
+ * This function explicitly checks the level attribute and returns the id
+ * of the first cache at level 3.
+ *
  * Returns -1 on failure.
  */
 static int get_l3_id(int cpu)
 {
     char path[256];
-    int id;
 
-    /* Try each cache index level looking for a unified L3 */
-    for (int idx = 0; idx <= 4; idx++) {
-        char type_path[256];
-        snprintf(type_path, sizeof(type_path),
-                 "/sys/devices/system/cpu/cpu%d/cache/index%d/type",
+    for (int idx = 0; idx <= 7; idx++) {
+        char level_path[256];
+        snprintf(level_path, sizeof(level_path),
+                 "/sys/devices/system/cpu/cpu%d/cache/index%d/level",
                  cpu, idx);
-        FILE *tf = fopen(type_path, "r");
-        if (!tf) continue;
-        char type[32] = {0};
-        if (fgets(type, sizeof(type), tf)) {
-            fclose(tf);
-            /* Only use Unified caches (L3 is always Unified) */
-            if (strncmp(type, "Unified", 7) != 0) continue;
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu%d/cache/index%d/id",
-                     cpu, idx);
-            if (read_int_from_file(path, &id)) return id;
-        } else {
-            fclose(tf);
-        }
+        FILE *lf = fopen(level_path, "r");
+        if (!lf) continue;
+        int level = 0;
+        int got = fscanf(lf, "%d", &level);
+        fclose(lf);
+        if (got != 1 || level != 3) continue;
+
+        /* Found L3 — read its id */
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cache/index%d/id",
+                 cpu, idx);
+        int id;
+        if (read_int_from_file(path, &id))
+            return id;
     }
     return -1;
 }
@@ -414,19 +424,21 @@ void topology_print_tiered_summary(const topology_t *t,
 {
     if (!t) return;
 
-    /* Track min per tier */
+    /* Track min and count per tier */
     double tier_min[5];
     int    tier_ai[5], tier_bi[5];
+    long   tier_count[5] = {0};
     for (int c = 0; c < 5; c++) {
         tier_min[c] = 1e18;
         tier_ai[c] = tier_bi[c] = -1;
     }
 
     for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
+        for (int j = 0; j < i; j++) {   /* lower triangle only */
             double m = means[i * n + j];
-            if (isnan(m) || m <= 0.0) continue;
             pair_class_t cls = topology_classify(t, cores[i], cores[j]);
+            tier_count[cls]++;
+            if (isnan(m) || m <= 0.0) continue;
             if (m < tier_min[cls]) {
                 tier_min[cls] = m;
                 tier_ai[cls]  = i;
@@ -441,13 +453,22 @@ void topology_print_tiered_summary(const topology_t *t,
     };
     for (int t2 = 0; t2 < 4; t2++) {
         pair_class_t cls = tiers[t2];
-        if (tier_ai[cls] < 0) continue;
+        if (tier_count[cls] == 0) {
+            fprintf(stderr, "    %-14s  (no pairs in this run)\n",
+                    pair_class_name(cls));
+            continue;
+        }
+        if (tier_ai[cls] < 0) {
+            fprintf(stderr, "    %-14s  %ld pairs, no valid measurements\n",
+                    pair_class_name(cls), tier_count[cls]);
+            continue;
+        }
         int ci = cores[tier_ai[cls]];
         int cj = cores[tier_bi[cls]];
         int ccd_i = (t && ci < MAX_CORES) ? t->cpu_ccd[ci] : -1;
         int ccd_j = (t && cj < MAX_CORES) ? t->cpu_ccd[cj] : -1;
-        fprintf(stderr, "    %-14s  min %.1f ns  cores (%d,%d)",
-                pair_class_name(cls), tier_min[cls], ci, cj);
+        fprintf(stderr, "    %-14s  min %.1f ns  cores (%d,%d)  [%ld pairs]",
+                pair_class_name(cls), tier_min[cls], ci, cj, tier_count[cls]);
         if (ccd_i >= 0 && ccd_j >= 0) {
             if (ccd_i == ccd_j)
                 fprintf(stderr, "  [CCD %d]", ccd_i);

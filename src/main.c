@@ -260,24 +260,122 @@ int main(int argc, char *argv[])
                 "WARN: --topology has no effect on benchmark %d. "
                 "Use -b 4 --topology for topology-aware measurement.\n", b);
 
-        /* Runtime estimate */
+        /*
+         * Runtime estimate.
+         *
+         * Calibrated from empirical measurements on AMD EPYC 9575F (Zen 5,
+         * NPS4): cross-CCD LOCK CMPXCHG round-trips measure ~190-200 ns
+         * one-way, intra-CCD/HT pairs measure ~30 ns one-way. These are
+         * far higher than the textbook figures (cross-CCD plain MOV
+         * ~30-60 ns) because (a) bench 1 uses LOCK which serialises
+         * coherence on AMD, and (b) NPS4 partitioning routes cross-CCD
+         * coherence through the IO die with home-directory serialisation.
+         *
+         * Per-tier one-way latencies used here are conservative (skewed
+         * high to avoid optimistic estimates):
+         *   HT-sibling / intra-CCD: ~35 ns
+         *   cross-CCD same socket:  ~200 ns
+         *   cross-NUMA / cross-socket: ~250 ns
+         *
+         * Per-benchmark multipliers reflect the relative per-iteration
+         * cost. Bench 1 is the calibration baseline at 1.0×:
+         *   bench 1 (CAS / LOCK CMPXCHG)        × 1.00  — baseline
+         *   bench 2 (plain MOV, per-sample RDTSC) × 0.90  — no LOCK overhead
+         *   bench 3 (one-way RDTSC-stamped)     × 0.95  — per-iter RDTSC
+         *   bench 4 (plain MOV, amortised)      × 1.10  — round bounded by
+         *                                                 slowest pair
+         *
+         * For benchmark 4 (parallel scheduler), round time is bounded by
+         * the slowest pair in the round, so we estimate per-round cost
+         * using cross-CCD or cross-NUMA latency for the worst case.
+         */
         {
             long n_pairs = (long)n_cores * (n_cores - 1) / 2;
-            /* Sequential benchmarks (1,2,3): one pair at a time */
-            /* Parallel benchmark (4): n/2 pairs per round, n-1 rounds */
-            long effective_pairs = (b == 4)
-                ? (n_cores - 1)          /* rounds, each ~same cost as 1 pair */
-                : n_pairs;
-            /* Conservative avg round-trip: 50 ns covers most topologies */
-            double est_ns  = (double)effective_pairs
-                             * (num_samples + 5)
-                             * num_iterations
-                             * 50.0;
-            double est_sec = est_ns / 1e9;
-            if (est_sec < 60)
-                fprintf(stderr, "  Estimated runtime: %.0f seconds\n", est_sec);
+
+            /* Per-benchmark multiplier (relative to bench 1) */
+            double bench_factor;
+            switch (b) {
+            case 1:  bench_factor = 1.00; break;
+            case 2:  bench_factor = 0.90; break;
+            case 3:  bench_factor = 0.95; break;
+            case 4:  bench_factor = 1.10; break;
+            default: bench_factor = 1.00; break;
+            }
+
+            double avg_one_way_ns;
+            if (topo_ptr) {
+                /* Topology known — classify each pair */
+                long n_local = 0, n_cross_ccd = 0, n_cross_numa = 0;
+                for (int i = 0; i < n_cores; i++) {
+                    for (int j = 0; j < i; j++) {
+                        pair_class_t cls = topology_classify(topo_ptr,
+                                cores[i], cores[j]);
+                        switch (cls) {
+                        case PAIR_HT_SIBLING:
+                        case PAIR_INTRA_CCD:
+                            n_local++;        break;
+                        case PAIR_CROSS_CCD:
+                            n_cross_ccd++;    break;
+                        case PAIR_CROSS_NUMA:
+                            n_cross_numa++;   break;
+                        default:
+                            n_cross_ccd++;    break;  /* unknown ≈ cross-CCD */
+                        }
+                    }
+                }
+                double total_ns = n_local       * 35.0
+                                + n_cross_ccd   * 200.0
+                                + n_cross_numa  * 250.0;
+                avg_one_way_ns = (n_pairs > 0) ? total_ns / n_pairs : 100.0;
+            } else {
+                /* No topology — use a single conservative average */
+                avg_one_way_ns = 150.0;
+            }
+
+            /* Apply per-benchmark adjustment */
+            avg_one_way_ns *= bench_factor;
+
+            double per_pair_ms = (num_samples + 5)
+                                 * num_iterations
+                                 * avg_one_way_ns
+                                 * 2.0          /* round-trip per iter */
+                                 / 1.0e6;       /* ns → ms */
+
+            double est_sec;
+            if (b == 4) {
+                /*
+                 * Parallel scheduler: n-1 rounds, each round time
+                 * dominated by the slowest pair in it. With topology
+                 * mode, slowest pair per round is cross-CCD or
+                 * cross-NUMA. Per-pair fixed overhead is amortised.
+                 */
+                double worst_one_way_ns = topo_ptr
+                    ? (topo_ptr->n_numa > 1 ? 250.0 : 200.0)
+                    : 200.0;
+                worst_one_way_ns *= bench_factor;
+                double per_round_ms = (num_samples + 5)
+                                      * num_iterations
+                                      * worst_one_way_ns
+                                      * 2.0
+                                      / 1.0e6;
+                est_sec = (n_cores - 1) * per_round_ms / 1000.0;
+                est_sec += 0.2;  /* startup overhead */
+            } else {
+                /* Sequential: sum of all pair times */
+                /* Plus ~0.1 ms per pair for pthread_create/join */
+                est_sec = (per_pair_ms + 0.1) * n_pairs / 1000.0;
+            }
+
+            const char *qual = topo_ptr ? "" : " (no topology — rough)";
+            if (est_sec < 5)
+                fprintf(stderr, "  Estimated runtime: ~%.1f seconds%s\n",
+                        est_sec, qual);
+            else if (est_sec < 90)
+                fprintf(stderr, "  Estimated runtime: ~%.0f seconds%s\n",
+                        est_sec, qual);
             else
-                fprintf(stderr, "  Estimated runtime: %.1f minutes\n", est_sec / 60.0);
+                fprintf(stderr, "  Estimated runtime: ~%.1f minutes%s\n",
+                        est_sec / 60.0, qual);
         }
 
         switch (b) {
